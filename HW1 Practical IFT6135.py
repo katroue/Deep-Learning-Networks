@@ -238,7 +238,7 @@ class NeuralNetwork:
 
 
         # Calculate initial delta for the output layer
-        delta = activations[-1] - y
+        delta = self.loss_derivative(activations[-1], y) # dL/d(output)
 
         # Backward pass - Iterate backwards through the layers
         for i in reversed(range(len(self.layers))):
@@ -355,8 +355,9 @@ class NeuralNetwork:
             total_loss = 0
             for i in range(len(X)):
                 # Calculate loss for the current sample
+                output = np.array(self.forward(X[i]))
                 output = self.forward(X[i])
-                loss = -np.sum(y[i] * np.log(output + 1e-9)) # Cross-entropy loss
+                loss = self.compute_loss(output, y[i])
                 total_loss += loss
                 self.backward(X[i], y[i], learning_rate)
 
@@ -367,6 +368,34 @@ class NeuralNetwork:
                 predictions = self.predict(X)
                 accuracy = self.compute_accuracy(predictions, y) # Use compute_accuracy
                 print(f"Epoch {epoch}, Loss: {average_loss:.4f}, Accuracy: {accuracy:.4f}")
+    
+    def compute_loss(self, predictions, y_true):
+        """
+        Compute cross-entropy loss.
+
+        Args:
+            predictions (np.array): Model predictions
+            y_true (np.array): True labels (one-hot encoded)
+
+        Returns:
+            float: Cross-entropy loss
+        """
+        # Avoid log(0) by adding a small constant
+        loss = -np.sum(y_true * np.log(predictions + 1e-9)) / y_true.shape[0]
+        return loss
+    
+    def loss_derivative(self, predictions, y_true):
+        """
+        Compute the derivative of the cross-entropy loss.
+
+        Args:
+            predictions (np.array): Model predictions
+            y_true (np.array): True labels (one-hot encoded)
+
+        Returns:
+            np.array: Derivative of the loss
+        """
+        return predictions - y_true
 
 
     def compute_accuracy(self, predictions, y_true):
@@ -460,10 +489,109 @@ def train_network(hidden_layer_size, hidden_dim, epochs, activation_hidden, acti
 
     return nn, train_loss, train_accuracy, test_accuracy
 
-hidden_layer_size = 128
-hidden_dim = 128
-epochs = 10
+hidden_layer_size = 512
+hidden_dim = 512
+epochs = 30
 activation_hidden = ActivationFunction.relu
 activation_output = ActivationFunction.softmax
 learning_rate = 0.001
 nn, train_loss, train_accuracy, test_accuracy = train_network(hidden_layer_size, hidden_dim,  epochs, activation_hidden, activation_output, learning_rate)
+
+
+print("Train accuracy: ", train_accuracy)
+print("Test accuracy: ", test_accuracy)
+
+# Plot the training loss across 20 epochs
+
+def plot_loss_curve(train_loss):
+    plt.figure(figsize=(8, 5))
+    plt.plot(range(1, len(train_loss) + 1), train_loss, marker='o')
+    plt.title("Training Loss Across Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.xticks(range(1, len(train_loss) + 1, 5))
+    plt.grid(True)
+    plt.show()
+    
+#plot_loss_curve(nn.loss_history)
+
+
+# ===== Latent Space Visualization =====
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import inspect # Import inspect for type checking
+
+def get_penultimate_activations(nn, X_batch):
+    """Get activations from the last hidden layer"""
+    # Check if nn is an instance of the custom NeuralNetwork and has layers
+    if not hasattr(nn, 'layers') or not isinstance(nn.layers, list):
+        print(f"Error: Expected nn to have a 'layers' attribute which is a list, but got type {type(nn)} with layers: {getattr(nn, 'layers', 'N/A')}")
+        return np.array([]) # Return empty array or raise error
+
+    # Process each sample individually
+    activations_list = []
+    for x in X_batch:
+        activations = x
+        # Iterate through layers, excluding the last one
+        for i in range(len(nn.layers) - 1): # Iterate through all layers except the output layer
+            layer = nn.layers[i]
+            # The forward pass in the custom Layer class expects a single input sample
+            # Ensure the layer is a custom Layer instance before calling forward
+            if not isinstance(layer, Layer):
+                print(f"Error: Expected layer at index {i} to be a custom Layer instance, but got type {type(layer)}")
+                return np.array([]) # Return empty array or raise error
+
+            activations = layer.forward(activations)
+        activations_list.append(activations)
+    return np.array(activations_list)
+
+def visualize_activations(nn, X_test, y_test, digits=(3, 8), method='PCA'):
+    """Visualize layer activations using PCA or t-SNE"""
+    # Get activations from penultimate layer
+    Z = get_penultimate_activations(nn, X_test)
+
+    # If Z is empty, skip visualization
+    if Z.size == 0:
+        print("Skipping visualization due to error in getting activations.")
+        return None
+
+    # Apply dimensionality reduction
+    if method == 'PCA':
+        reducer = PCA(n_components=2)
+    else:  # t-SNE
+        reducer = TSNE(n_components=2, random_state=42)
+
+    Z_2d = reducer.fit_transform(Z)
+
+    # Plot visualization
+    plt.figure(figsize=(12, 5))
+
+    # Plot 2: Focus on specific digits
+    plt.subplot(1, 2, 2)
+    mask1 = y_test == digits[0]
+    mask2 = y_test == digits[1]
+
+    # write your code here
+    plt.scatter(Z_2d[mask1, 0], Z_2d[mask1, 1], label=f'Digit {digits[0]}', alpha=0.5)
+    plt.scatter(Z_2d[mask2, 0], Z_2d[mask2, 1], label=f'Digit {digits[1]}', alpha=0.5)
+    plt.legend()
+
+    plt.title(f'Latent Space: Digits {digits[0]} vs {digits[1]}')
+
+    plt.xlabel('Component 1')
+    plt.ylabel('Component 2')
+    plt.tight_layout()
+    plt.show()
+
+    return Z_2d
+
+# Get test dataset to use for visualization
+_, _, X_test, y_test = get_train_test_dataset()
+X_test_flat = X_test.reshape(X_test.shape[0], -1)
+y_test_np = y_test.numpy()
+
+# Visualize activations for digits 3 and 8 using PCA
+visualize_activations(nn, X_test_flat, y_test_np, digits=(3, 8), method='PCA')
+
+# Visualize activations for digits 3 and 8 using t-SNE
+visualize_activations(nn, X_test_flat, y_test_np, digits=(3, 8), method='TSNE')
