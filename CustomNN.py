@@ -489,9 +489,9 @@ def train_network(hidden_layer_size, hidden_dim, epochs, activation_hidden, acti
 
     return nn, train_loss, train_accuracy, test_accuracy
 
-hidden_layer_size = 512
-hidden_dim = 512
-epochs = 30
+hidden_layer_size = 128
+hidden_dim = 128
+epochs = 35
 activation_hidden = ActivationFunction.relu
 activation_output = ActivationFunction.softmax
 learning_rate = 0.001
@@ -503,17 +503,46 @@ print("Test accuracy: ", test_accuracy)
 
 # Plot the training loss across 20 epochs
 
-def plot_loss_curve(train_loss):
-    plt.figure(figsize=(8, 5))
-    plt.plot(range(1, len(train_loss) + 1), train_loss, marker='o')
-    plt.title("Training Loss Across Epochs")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.xticks(range(1, len(train_loss) + 1, 5))
-    plt.grid(True)
+def plot_loss_curve(train_loss, val_loss=None, test_acc=None, title="Training Loss Across Epochs"):
+    """Plot training loss and optional validation loss across epochs and annotate test accuracy.
+
+    Args:
+        train_loss (list or array): training loss per epoch
+        val_loss (list or array, optional): validation loss per epoch (same length as train_loss)
+        test_acc (float, optional): test accuracy in percent (0-100)
+        title (str): plot title
+    """
+    epochs = len(train_loss)
+    x = list(range(1, epochs + 1))
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(x, train_loss, marker='o', label='Train Loss')
+    if val_loss is not None:
+        # if val_loss shorter/longer, truncate/pad to match train length gracefully
+        val_plot = val_loss[:epochs]
+        plt.plot(x, val_plot, marker='o', label='Validation Loss')
+
+    plt.title(title)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    # choose sensible xticks
+    step = max(1, epochs // 10)
+    plt.xticks(range(1, epochs + 1, step))
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend()
+
+    if test_acc is not None:
+        # annotate test accuracy on the plot
+        plt.gca().text(0.98, 0.95, f'Test Acc: {test_acc:.2f}%', transform=plt.gca().transAxes,
+                    horizontalalignment='right', verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    plt.tight_layout()
     plt.show()
-    
-#plot_loss_curve(nn.loss_history)
+
+
+# Backward-compatible call: existing code called plot_loss_curve(nn.loss_history)
+# plot_loss_curve(nn.loss_history)
 
 
 # ===== Latent Space Visualization =====
@@ -591,7 +620,7 @@ X_test_flat = X_test.reshape(X_test.shape[0], -1)
 y_test_np = y_test.numpy()
 
 # Visualize activations for digits 3 and 8 using PCA
-visualize_activations(nn, X_test_flat, y_test_np, digits=(3, 8), method='PCA')
+#visualize_activations(nn, X_test_flat, y_test_np, digits=(3, 8), method='PCA')
 
 # Visualize activations for digits 3 and 8 using t-SNE
-visualize_activations(nn, X_test_flat, y_test_np, digits=(3, 8), method='TSNE')
+#visualize_activations(nn, X_test_flat, y_test_np, digits=(3, 8), method='TSNE')

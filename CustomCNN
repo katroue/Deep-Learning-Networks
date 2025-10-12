@@ -14,11 +14,10 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# Device print removed to reduce console noise during training
 
 # Hyperparameters
 learning_rate = 1e-3  # or 3e-4
-num_epochs = 50
+num_epochs = 30
 batch_size = 64
 num_classes = 10
 validation_split = 0.2
@@ -156,10 +155,6 @@ class CustomConv2D(nn.Module):
         grad_output_reshaped = grad_output.permute(0, 2, 3, 1).reshape(N, H_out * W_out, C_out) # (N, L, C_out)
 
         # Calculate grad_weight: (C_out, C_in*k*k)
-        # grad_output_reshaped (N, L, C_out).transpose(1, 2) @ unfolded_input (N, C_in*k*k, L).transpose(1,2)
-        # This gives (N, C_out, L) @ (N, L, C_in*k*k) which is not right for batch matrix multiplication
-        # We need to perform batch matrix multiplication between (N, C_out, L).transpose(1,2) and (N, C_in*k*k, L).transpose(1,2).transpose(1,2)
-        # Or use einsum
         unfold_x = F.unfold(x, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding) # (N, C_in*k*k, L)
         # grad_output_reshaped: (N, L, C_out) -> permute to (N, C_out, L)
         grad_output_perm = grad_output_reshaped.permute(0, 2, 1)  # (N, C_out, L)
@@ -168,21 +163,11 @@ class CustomConv2D(nn.Module):
 
 
         # Calculate grad_input: (N, C_in, H, W)
-        # grad_input = fold(grad_output_unfolded)
-        # grad_output_unfolded shape is (N, C_in*k*k, L)
-        # We have dL/dZ = dL/d(output) * d(output)/dZ
-        # dZ/d(a_prev) is related to the weights (reshaped weights)
-        # grad_output_reshaped (N, L, C_out) @ weights_reshape (C_in*k*k, C_out).T = (N, L, C_in*k*k)
         grad_unfold = grad_output_reshaped @ self.weight.view(self.out_channels, -1) # (N, L, C_in*k*k)
         grad_unfold = grad_unfold.transpose(1, 2) # (N, C_in*k*k, L)
 
-    # Debug prints removed to reduce console noise
-
         # Fold back to image space
         grad_input = F.fold(grad_unfold, output_size=x.shape[2:], kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
-
-    # Debug prints removed to reduce console noise
-
 
         return grad_input, grad_weight, grad_bias
     
@@ -219,7 +204,6 @@ class CustomMaxPool2D(nn.Module):
           • Cache argmax indices + shapes.
           • Reshape output reshaped to (N, C, H_out, W_out).
         """
-        #print(f"MaxPool2D input shape: {x.shape}") # Added print statement
         unfold_x = F.unfold(x, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
         # reshape to (N, C, k*k, L) where L = number of sliding windows
         view_x = unfold_x.view(x.shape[0], x.shape[1], self.kernel_size * self.kernel_size, unfold_x.shape[2])
@@ -253,24 +237,10 @@ class CustomMaxPool2D(nn.Module):
         grad_output_reshaped = grad_output.view(N, C, -1) # Reshape to (N, C, L)
 
         # Scatter the gradients to the locations of the maximum values
-        # grad_unfold shape: (N, C, k*k, L) -> view_x shape during forward
-        # _cache_indices shape: (N, C, L)
-        # grad_output_reshaped shape: (N, C, L)
-        # We need to scatter grad_output_reshaped into grad_unfold at the indices stored in _cache_indices.
-        # Scatter requires the index tensor to have the same number of dimensions as the source tensor (excluding scatter dimension).
-        # grad_unfold is (N, C, k*k, L), grad_output_reshaped is (N, C, L).
-        # We need to scatter into the k*k dimension (dim=2) of a tensor that has N, C, k*k, L shape.
-        # Let's create a zero tensor with the shape before taking the max: (N, C, k*k, L)
         N, C, H_in, W_in = self._cache_shape
         L = (H_in + 2 * self.padding - self.kernel_size) // self.stride + 1
         L *= (W_in + 2 * self.padding - self.kernel_size) // self.stride + 1
         zeros_for_scatter = torch.zeros(N, C, self.kernel_size * self.kernel_size, L, device=grad_output.device)
-
-        # The scatter operation needs the index tensor and the source tensor to have compatible shapes.
-        # _cache_indices has shape (N, C, L). It contains indices along the k*k dimension.
-        # grad_output_reshaped has shape (N, C, L). These are the values to scatter.
-        # We want to place the values from grad_output_reshaped into zeros_for_scatter at the indices specified by _cache_indices along dim=2.
-        # scatter_(dim, index, src)
         scattered_grad = zeros_for_scatter.scatter_(2, self._cache_indices.unsqueeze(2), grad_output_reshaped.unsqueeze(2))
 
         # Reshape the scattered gradients back to (N, C*k*k, L)
@@ -354,7 +324,6 @@ class CNN(nn.Module):
         self.criterion = CustomCrossEntropyLoss()
 
     def forward(self, x):
-        # Reduced printing: remove per-batch debug output to speed up training
         z1 = self.conv1(x)
         a1 = self.ACT(z1)
         p1 = self.max1(a1)
@@ -543,6 +512,48 @@ def train_one_config(activation_name="relu", epochs=num_epochs, lr=learning_rate
         "test_acc": test_acc
     }
 
+
+def plot_results(config_name, results):
+    """Plot train/validation loss and accuracy and annotate test accuracy.
+
+    results: dict with keys 'train_loss','val_loss','train_acc','val_acc','test_acc'
+    """
+    epochs = len(results["train_loss"])
+    x = list(range(1, epochs + 1))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Loss plot
+    axes[0].plot(x, results["train_loss"], label="Train Loss", marker='o')
+    axes[0].plot(x, results["val_loss"], label="Val Loss", marker='o')
+    axes[0].set_title(f"{config_name} — Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].grid(True, linestyle='--', alpha=0.6)
+    axes[0].legend()
+
+    # Accuracy plot
+    axes[1].plot(x, [a * 100 for a in results["train_acc"]], label="Train Acc", marker='o')
+    axes[1].plot(x, [a * 100 for a in results["val_acc"]], label="Val Acc", marker='o')
+    axes[1].set_title(f"{config_name} — Accuracy")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Accuracy (%)")
+    axes[1].grid(True, linestyle='--', alpha=0.6)
+    axes[1].legend()
+
+    # Annotate test accuracy
+    test_acc = results.get("test_acc")
+    if test_acc is not None:
+        axes[1].axhline(test_acc, color='red', linestyle='--', linewidth=1, label=f"Test Acc: {test_acc:.2f}%")
+        axes[1].legend()
+        # also print on loss plot for visibility
+        axes[0].text(0.02, 0.95, f"Test Acc: {test_acc:.2f}%", transform=axes[0].transAxes,
+                     fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    fig.suptitle(f"Training curves — {config_name}")
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
 # Training, and experiments : 4 configurations in total
 activ_relu = "relu"
 activ_tanh = "tanh"
@@ -551,12 +562,16 @@ lr_3e4 = 3e-4
 
 print("Training with ReLU and LR = 1e-3")
 results_relu_1e3 = train_one_config(activation_name=activ_relu, lr=lr_1e3)
+plot_results("ReLU | lr=1e-3", results_relu_1e3)
 
 print("\nTraining with ReLU and LR = 3e-4")
 results_relu_3e4 = train_one_config(activation_name=activ_relu, lr=lr_3e4)
+plot_results("ReLU | lr=3e-4", results_relu_3e4)
 
 print("\nTraining with Tanh and LR = 1e-3")
 results_tanh_1e3 = train_one_config(activation_name=activ_tanh, lr=lr_1e3)
+plot_results("Tanh | lr=1e-3", results_tanh_1e3)
 
 print("\nTraining with Tanh and LR = 3e-4")
 results_tanh_3e4 = train_one_config(activation_name=activ_tanh, lr=lr_3e4)
+plot_results("Tanh | lr=3e-4", results_tanh_3e4)
