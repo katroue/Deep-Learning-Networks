@@ -1,0 +1,562 @@
+
+import math, random, time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+from torchvision import datasets
+from torchvision.transforms import ToTensor
+import matplotlib.pyplot as plt
+
+SEED = 42
+random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# Hyperparameters
+learning_rate = 1e-3  # or 3e-4
+num_epochs = 50
+batch_size = 64
+num_classes = 10
+validation_split = 0.2
+
+
+class CustomLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.bias   = nn.Parameter(torch.Tensor(out_features)) if bias else None
+        self.reset_parameters()
+        self._cache_x = None
+
+    def reset_parameters(self):
+        # Kaiming Uniform (fixed by assignment)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        """
+        TODO: Compute y = x W^T + b.
+        Hints:
+          • Use a batched matmul pattern that preserves leading batch dims.
+          • Add bias if present.
+        """
+        self._cache_x = x
+        "WRITE YOUR CODE HERE"
+        foward = x @ self.weight.T
+        if self.bias is not None:
+            forward += self.bias
+        return forward
+
+    def backward(self, grad_output):
+        """
+        TODO: Compute gradients wrt input, weight, bias.
+        param grad_output: gradient wrt output
+        Return: (grad_input, grad_weight, grad_bias)
+        """
+        x = self._cache_x
+
+        grad_input  = grad_output @ self.weight
+        grad_weight = grad_output.transpose(0, 1) @ x
+        grad_bias = grad_output.sum(dim=0) if self.bias is not None else None
+
+        return grad_input, grad_weight, grad_bias
+
+class CustomConv2D(nn.Module):
+    """
+    2D Convolution (k x k) with manual forward/backward using unfold/fold.
+
+    Shapes and symbols:
+      x: input of shape (N, C_in, H, W)
+        N = batch size, C_in = input channels, H/W = spatial dims: Heigth/Width
+      w: weights of shape (C_out, C_in, k, k), with C_out = output channels
+      b: bias of shape (C_out,)
+      k: kernel_size
+      s: stride
+      p: padding
+
+      H_out = floor((H + 2*p - k)/s) + 1
+      W_out = floor((W + 2*p - k)/s) + 1
+      L = H_out * W_out   # number of sliding-window locations per feature map
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.weight = nn.Parameter(torch.Tensor(out_channels, in_channels, kernel_size, kernel_size))
+        self.bias   = nn.Parameter(torch.Tensor(out_channels))
+        self.reset_parameters()
+        self._cache_x = None
+
+    def reset_parameters(self):
+        # Kaiming Uniform (fixed)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        """
+        TODO: Compute conv output using F.unfold and a batched dot-product.
+        Hints:
+          • Unfold to shape (N, C_in*k*k, L) where L is number of locations.
+          • Reshape weights to (C_out, C_in*k*k).
+          • Add bias per output channel.
+          • Reshape to (N, C_out, H_out, W_out).
+        """
+        self._cache_x = x
+        unfold = F.unfold(x, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+        weights_reshape = self.weight.view(self.out_channels, -1)
+
+        # Perform batched matrix multiplication: (N, C_in*k*k, L).transpose(1, 2) @ (C_in*k*k, C_out).transpose(0, 1)
+        # The result will be (N, L, C_out)
+        output = unfold.transpose(1, 2) @ weights_reshape.T
+
+        # Reshape the output to (N, C_out, H_out, W_out)
+        N, L, C_out = output.shape
+        H_in, W_in = x.shape[2:]
+        H_out = (H_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+        W_out = (W_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+
+        output = output.view(N, H_out, W_out, C_out).permute(0, 3, 1, 2)
+
+        if self.bias is not None:
+            output += self.bias.view(1, -1, 1, 1)
+
+        return output
+
+    def backward(self, grad_output):
+        """
+        TODO: Compute gradients wrt input, weight, bias.
+        Hints:
+          • Reuse unfolded patches.
+          • grad_weight: correlate grad_output with unfolded input patches.
+          • grad_bias: sum grad_output over batch and spatial locations.
+          • grad_input: map grads back via an unfolded representation and fold.
+        Return: (grad_input, grad_weight, grad_bias)
+        """
+        x = self._cache_x
+
+        # Calculate grad_bias: sum grad_output over batch and spatial dimensions
+        grad_bias = grad_output.sum(dim=(0, 2, 3)) if self.bias is not None else None
+
+        # Reshape grad_output for matrix multiplication with unfolded input
+        N, C_out, H_out, W_out = grad_output.shape
+        grad_output_reshaped = grad_output.permute(0, 2, 3, 1).reshape(N, H_out * W_out, C_out) # (N, L, C_out)
+
+        # Calculate grad_weight: (C_out, C_in*k*k)
+        # grad_output_reshaped (N, L, C_out).transpose(1, 2) @ unfolded_input (N, C_in*k*k, L).transpose(1,2)
+        # This gives (N, C_out, L) @ (N, L, C_in*k*k) which is not right for batch matrix multiplication
+        # We need to perform batch matrix multiplication between (N, C_out, L).transpose(1,2) and (N, C_in*k*k, L).transpose(1,2).transpose(1,2)
+        # Or use einsum
+        unfold_x = F.unfold(x, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding) # (N, C_in*k*k, L)
+        grad_weight = torch.einsum('nco,nkl->ock', grad_output_reshaped, unfold_x).view(self.weight.shape)
+
+
+        # Calculate grad_input: (N, C_in, H, W)
+        # grad_input = fold(grad_output_unfolded)
+        # grad_output_unfolded shape is (N, C_in*k*k, L)
+        # We have dL/dZ = dL/d(output) * d(output)/dZ
+        # dZ/d(a_prev) is related to the weights (reshaped weights)
+        # grad_output_reshaped (N, L, C_out) @ weights_reshape (C_in*k*k, C_out).T = (N, L, C_in*k*k)
+        grad_unfold = grad_output_reshaped @ self.weight.view(self.out_channels, -1) # (N, L, C_in*k*k)
+        grad_unfold = grad_unfold.transpose(1, 2) # (N, C_in*k*k, L)
+
+        print(f"CustomConv2D backward - grad_unfold shape before fold: {grad_unfold.shape}")
+        print(f"CustomConv2D backward - fold output_size: {x.shape[2:]}")
+
+        # Fold back to image space
+        grad_input = F.fold(grad_unfold, output_size=x.shape[2:], kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+
+        print(f"CustomConv2D backward - grad_input shape after fold: {grad_input.shape}")
+
+
+        return grad_input, grad_weight, grad_bias
+    
+class CustomMaxPool2D(nn.Module):
+    """
+    Max Pooling (k x k) with manual forward/backward using unfold/fold.
+
+    Shapes and symbols:
+      x: input of shape (N, C, H, W)
+        N = batch size, C = channels, H/W = spatial dims: Height, Width
+      k: kernel_size (pool window is k x k)
+      s: stride
+      p: padding
+
+      H_out = floor((H + 2*p - k)/s) + 1
+      W_out = floor((W + 2*p - k)/s) + 1
+      L = H_out * W_out   # number of sliding-window locations per feature map
+    """
+    def __init__(self, kernel_size, stride=None, padding=0):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self._cache_shape = None
+        self._cache_indices = None
+
+    def forward(self, x):
+        """
+        TODO: Max over k*k windows.
+        Hints:
+          • Unfold x → patches of shape (N, C*k*k, L)
+          • View → (N, C, k*k, L)
+          • Take max over the k*k dimension → outputs (N, C, L) and argmax indices (N, C, L)
+          • Cache argmax indices + shapes.
+          • Reshape output reshaped to (N, C, H_out, W_out).
+        """
+        #print(f"MaxPool2D input shape: {x.shape}") # Added print statement
+        unfold_x = F.unfold(x, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+        view_x = unfold_x.view(x.shape[0], x.shape[1], self.kernel_size, self.kernel_size, unfold_x.shape[2])
+        max_x, self._cache_indices = view_x.max(dim=2)
+        self._cache_shape = x.shape
+
+        # Reshape output to (N, C, H_out, W_out)
+        N, C, L = max_x.shape
+        H_in, W_in = x.shape[2:]
+        H_out = (H_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+        W_out = (W_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+        output = max_x.view(N, C, H_out, W_out)
+
+        return output
+
+    def backward(self, grad_output):
+        """
+        TODO: Implement max pooling backward (route grads to maxima only).
+        Inputs: grad_output: (N, C, H_out, W_out)
+        Hints:
+          • Make zeros tensor grad_unfold of shape (N, C, k*k, L)
+          • Scatter grad_output into grad_unfold at the argmax positions from forward
+          • View grad_unfold → (N, C*k*k, L)
+          • Fold back to image space → grad_input of shape (N, C, H, W)
+
+        Return: grad_input(N, C, H, W)
+        """
+        grad_unfold = torch.zeros(self._cache_shape, device=grad_output.device)
+        # Reshape grad_output to (N, C, L) to match _cache_indices shape for scattering
+        N, C, H_out, W_out = grad_output.shape
+        grad_output_reshaped = grad_output.view(N, C, -1) # Reshape to (N, C, L)
+
+        # Scatter the gradients to the locations of the maximum values
+        # grad_unfold shape: (N, C, k*k, L) -> view_x shape during forward
+        # _cache_indices shape: (N, C, L)
+        # grad_output_reshaped shape: (N, C, L)
+        # We need to scatter grad_output_reshaped into grad_unfold at the indices stored in _cache_indices.
+        # Scatter requires the index tensor to have the same number of dimensions as the source tensor (excluding scatter dimension).
+        # grad_unfold is (N, C, k*k, L), grad_output_reshaped is (N, C, L).
+        # We need to scatter into the k*k dimension (dim=2) of a tensor that has N, C, k*k, L shape.
+        # Let's create a zero tensor with the shape before taking the max: (N, C, k*k, L)
+        N, C, H_in, W_in = self._cache_shape
+        L = (H_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+        L *= (W_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+        zeros_for_scatter = torch.zeros(N, C, self.kernel_size * self.kernel_size, L, device=grad_output.device)
+
+        # The scatter operation needs the index tensor and the source tensor to have compatible shapes.
+        # _cache_indices has shape (N, C, L). It contains indices along the k*k dimension.
+        # grad_output_reshaped has shape (N, C, L). These are the values to scatter.
+        # We want to place the values from grad_output_reshaped into zeros_for_scatter at the indices specified by _cache_indices along dim=2.
+        # scatter_(dim, index, src)
+        scattered_grad = zeros_for_scatter.scatter_(2, self._cache_indices.unsqueeze(2), grad_output_reshaped.unsqueeze(2))
+
+        # Reshape the scattered gradients back to (N, C*k*k, L)
+        grad_unfold = scattered_grad.view(N, C * self.kernel_size * self.kernel_size, L)
+
+        # Fold back to image space
+        grad_input = F.fold(grad_unfold, output_size=(H_in, W_in), kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+
+        return grad_input
+    
+class CustomCrossEntropyLoss(nn.Module):
+    def __init__(self, reduction="mean"):
+        super().__init__()
+        self.reduction = reduction
+        self._cache = None
+
+    def forward(self, logits, targets):
+        """
+        TODO: Compute numerically-stable cross-entropy.
+        Hints:
+          • Subtract max per row before exponentiation.
+          • Convert to probabilities; pick class probs at targets.
+          • Apply -log(...) and reduction (mean by default).
+          • Cache what's needed for backward.
+        """
+        max_per_row, _ = logits.max(dim=1, keepdim=True)
+        logits_shifted = logits - max_per_row
+        probs = torch.exp(logits_shifted) / torch.exp(logits_shifted).sum(dim=1, keepdims=True)
+        class_probs = probs[torch.arange(logits.shape[0]), targets]
+        loss = -torch.log(class_probs)
+        if self.reduction == "mean":
+            loss = loss.mean()
+        elif self.reduction == "sum":
+            loss = loss.sum()
+        self._cache = probs # Cache probs for backward if logits/targets are not passed
+        return loss
+
+    def backward(self, logits, targets):
+        """
+        TODO: Compute gradient w.r.t. logits.
+        Hints:
+          • If `logits` and `targets` are provided, recompute softmax probs stably.
+            Otherwise, use cached probs/targets from forward().
+          • Divide by batch size if reduction == 'mean'.
+        Return: grad_logits
+        """
+        # Recompute probs for backward pass to ensure it's part of the current computation graph
+        max_per_row, _ = logits.max(dim=1, keepdim=True)
+        logits_shifted = logits - max_per_row
+        probs = torch.exp(logits_shifted) / torch.exp(logits_shifted).sum(dim=1, keepdims=True)
+
+        # Compute the gradient of the loss with respect to the logits
+        grad_logits = probs.clone() # Create a clone to avoid modifying probs in-place
+        grad_logits[torch.arange(logits.shape[0]), targets] -= 1
+
+        if self.reduction == "mean":
+            grad_logits /= logits.shape[0]
+
+        return grad_logits
+    
+def get_activation(name):
+    if name.lower() == "relu":
+        return F.relu, lambda z: (z > 0).to(z.dtype)
+    elif name.lower() == "tanh":
+        return torch.tanh, lambda z: 1 - torch.tanh(z)**2
+    else:
+        raise ValueError("Unknown activation: " + name)
+
+class CNN(nn.Module):
+    def __init__(self, activation_name="relu", num_classes=10):
+        super().__init__()
+        self.ACT, self.ACT_PRIME = get_activation(activation_name)
+
+        self.conv1 = CustomConv2D(1, 32, 5)
+        self.conv2 = CustomConv2D(32, 64, 3) # Reduced kernel size to 3
+        self.max1  = CustomMaxPool2D(2, stride=2)
+        self.max2  = CustomMaxPool2D(2, stride=2)
+        self.fc1   = CustomLinear(64*4*4, 512)
+        self.fc2   = CustomLinear(512, num_classes)
+
+        self.criterion = CustomCrossEntropyLoss()
+
+    def forward(self, x):
+        print(f"Input shape: {x.shape}")
+        z1 = self.conv1(x)
+        print(f"conv1 output shape: {z1.shape}")
+        a1 = self.ACT(z1)
+        print(f"a1 shape: {a1.shape}")
+        p1 = self.max1(a1)
+        print(f"max1 output shape: {p1.shape}")
+
+        z2 = self.conv2(p1)
+        print(f"conv2 output shape: {z2.shape}")
+        a2 = self.ACT(z2)
+        print(f"a2 shape: {a2.shape}")
+        p2 = self.max2(a2)
+        print(f"max2 output shape: {p2.shape}")
+
+        flat = torch.flatten(p2, start_dim=1)
+        print(f"flattened shape: {flat.shape}")
+        z3 = self.fc1(flat)
+        print(f"fc1 output shape: {z3.shape}")
+        a3 = self.ACT(z3)
+        print(f"a3 shape: {a3.shape}")
+        logits = self.fc2(a3)
+        print(f"logits shape: {logits.shape}")
+
+        # caches needed for manual backward
+        caches = (z1, a1, p1, z2, a2, p2, z3, a3)
+        return logits, caches
+    
+
+full_train = datasets.MNIST(root="./data_CNN", train=True, download=True, transform=ToTensor())
+test_ds    = datasets.MNIST(root="./data_CNN", train=False, download=True, transform=ToTensor())
+
+train_size = int((1 - validation_split) * len(full_train))
+val_size   = len(full_train) - train_size
+train_ds, val_ds = random_split(full_train, [train_size, val_size])
+
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+
+print(f"Train/Val/Test sizes: {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
+
+
+@torch.no_grad()
+def accuracy_from_logits(logits, labels):
+    return (logits.argmax(dim=1) == labels).float().mean().item()
+
+def sgd_update_(param, grad, lr):
+    param -= lr * grad
+    return param
+
+def train_one_config(activation_name="relu", epochs=num_epochs, lr=learning_rate, num_classes=num_classes):
+    model = CNN(activation_name=activation_name, num_classes=num_classes).to(device)
+    criterion = model.criterion
+
+    train_losses, val_losses = [], []
+    train_accs,   val_accs   = [], []
+
+    for epoch in range(epochs):
+        model.train()
+        total_train_loss, total_train_correct, total_train_examples = 0.0, 0, 0
+
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+
+            # ---------- Forward ----------
+            logits, caches = model(xb)
+            loss = criterion(logits, yb)
+
+            # Unpack caches (pre/post activations)
+            z1, a1, p1, z2, a2, p2, z3, a3 = caches # Corrected unpacking to match the 8 cached values
+
+            # ==========================================================================
+            # BACKWARD PASS (explicit chaining with your .backward methods)
+            # TODO: Implement the manual chain below and produce gradients with names:
+            #       grad_fc2_w, grad_fc2_b, grad_fc1_w, grad_fc1_b,
+            #       grad_conv2_w, grad_conv2_b, grad_conv1_w, grad_conv1_b
+            #
+            # Hints:
+            #   1- Check PARAMETER UPDATES codes below for ideas and variable names
+            #   2- Chain in the following way:
+            #       - dL/dlogits from Cross-Entropy Loss
+            #       - FC2 backward
+            #       - Activation after FC1
+            #       - FC1 backward
+            #       - Reshape to feature map
+            #       - MaxPool2 backward
+            #       - Activation after Conv2
+            #       - Conv2 backward
+            #       - MaxPool1 backward
+            #       - Activation after Conv1
+            #       - Conv1 backward
+            grad_output = criterion.backward(logits=logits, targets=yb)
+
+            # Backpropagate through FC2
+            grad_fc2_input, grad_fc2_w, grad_fc2_b = model.fc2.backward(grad_output=grad_output)
+
+            # Backpropagate through Activation after FC1
+            grad_activation3 = grad_fc2_input * model.ACT_PRIME(z3) # Apply derivative of activation function
+
+            # Backpropagate through FC1
+            grad_fc1_input, grad_fc1_w, grad_fc1_b = model.fc1.backward(grad_output=grad_activation3)
+
+            # Reshape gradient from FC1 input to match the shape before flattening (N, 64, 5, 5)
+            grad_fc1_input_reshaped = grad_fc1_input.view(grad_fc1_input.shape[0], 64, 5, 5)
+
+            # Backpropagate through MaxPool2
+            grad_max2_input = model.max2.backward(grad_output=grad_fc1_input_reshaped)
+
+            # Backpropagate through Activation after Conv2
+            grad_activation2 = grad_max2_input * model.ACT_PRIME(z2) # Apply derivative of activation function
+
+            # Backpropagate through Conv2
+            grad_conv2_input, grad_conv2_w, grad_conv2_b = model.conv2.backward(grad_output=grad_activation2)
+
+            # Backpropagate through MaxPool1
+            grad_max1_input = model.max1.backward(grad_output=grad_conv2_input)
+
+            # Backpropagate through Activation after Conv1
+            grad_activation1 = grad_max1_input * model.ACT_PRIME(z1) # Apply derivative of activation function
+
+            # Backpropagate through Conv1
+            grad_conv1_input, grad_conv1_w, grad_conv1_b = model.conv1.backward(grad_output=grad_activation1)
+
+
+            # ===========================================
+            # PARAMETER UPDATES (manual SGD with no_grad)
+            # TODO: UNCOMMENT THE CODES BELOW, DO NOT CHANGE
+            # ===========================================
+            with torch.no_grad():
+                 # FC2
+                 model.fc2.weight.copy_(sgd_update_(model.fc2.weight, grad_fc2_w, lr))
+                 if model.fc2.bias is not None:
+                     model.fc2.bias.copy_(sgd_update_(model.fc2.bias, grad_fc2_b, lr))
+                 # FC1
+                 model.fc1.weight.copy_(sgd_update_(model.fc1.weight, grad_fc1_w, lr))
+                 if model.fc1.bias is not None:
+                     model.fc1.bias.copy_(sgd_update_(model.fc1.bias, grad_fc1_b, lr))
+                 # Conv2
+                 model.conv2.weight.copy_(sgd_update_(model.conv2.weight, grad_conv2_w, lr))
+                 model.conv2.bias.copy_(sgd_update_(model.conv2.bias, grad_conv2_b, lr))
+                 # Conv1
+                 model.conv1.weight.copy_(sgd_update_(model.conv1.weight, grad_conv1_w, lr))
+                 model.conv1.bias.copy_(sgd_update_(model.conv1.bias, grad_conv1_b, lr))
+
+
+            # ---------- Train metrics ----------
+            with torch.no_grad():
+                total_train_loss += loss.item()
+                total_train_examples += yb.size(0)
+                total_train_correct += (logits.argmax(1) == yb).sum().item()
+
+        train_losses.append(total_train_loss / len(train_loader))
+        train_accs.append(total_train_correct / total_train_examples)
+
+        # ---------- Validation ----------
+        model.eval()
+        val_loss_sum, val_correct, val_examples = 0.0, 0, 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                logits, _ = model(xb)
+                loss = criterion(logits, yb)
+                val_loss_sum += loss.item()
+                val_examples += yb.size(0)
+                val_correct += (logits.argmax(1) == yb).sum().item()
+
+        val_losses.append(val_loss_sum / len(val_loader))
+        val_accs.append(val_correct / val_examples)
+
+        print(f"Epoch {epoch+1:02d} | "
+            f"Train Loss {train_losses[-1]:.4f}  Acc {train_accs[-1]*100:.2f}% | "
+            f"Val Loss {val_losses[-1]:.4f}  Acc {val_accs[-1]*100:.2f}%")
+
+    # ---------- Test ----------
+    model.eval()
+    test_correct, test_total = 0, 0
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            logits, _ = model(xb)
+            test_correct += (logits.argmax(1) == yb).sum().item()
+            test_total += yb.size(0)
+    test_acc = 100.0 * test_correct / test_total
+    print(f"Test Accuracy: {test_acc:.2f}%")
+
+    return {
+        "train_loss": train_losses, "val_loss": val_losses,
+        "train_acc": train_accs,   "val_acc": val_accs,
+        "test_acc": test_acc
+    }
+
+# Training, and experiments : 4 configurations in total
+activ_relu = "relu"
+activ_tanh = "tanh"
+lr_1e3 = 1e-3
+lr_3e4 = 3e-4
+
+print("Training with ReLU and LR = 1e-3")
+results_relu_1e3 = train_one_config(activation_name=activ_relu, lr=lr_1e3)
+
+print("\nTraining with ReLU and LR = 3e-4")
+results_relu_3e4 = train_one_config(activation_name=activ_relu, lr=lr_3e4)
+
+print("\nTraining with Tanh and LR = 1e-3")
+results_tanh_1e3 = train_one_config(activation_name=activ_tanh, lr=lr_1e3)
+
+print("\nTraining with Tanh and LR = 3e-4")
+results_tanh_3e4 = train_one_config(activation_name=activ_tanh, lr=lr_3e4)
