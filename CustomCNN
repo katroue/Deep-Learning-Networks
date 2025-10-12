@@ -14,7 +14,7 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Device:", device)
+# Device print removed to reduce console noise during training
 
 # Hyperparameters
 learning_rate = 1e-3  # or 3e-4
@@ -51,7 +51,7 @@ class CustomLinear(nn.Module):
         """
         self._cache_x = x
         "WRITE YOUR CODE HERE"
-        foward = x @ self.weight.T
+        forward = x @ self.weight.T
         if self.bias is not None:
             forward += self.bias
         return forward
@@ -161,7 +161,10 @@ class CustomConv2D(nn.Module):
         # We need to perform batch matrix multiplication between (N, C_out, L).transpose(1,2) and (N, C_in*k*k, L).transpose(1,2).transpose(1,2)
         # Or use einsum
         unfold_x = F.unfold(x, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding) # (N, C_in*k*k, L)
-        grad_weight = torch.einsum('nco,nkl->ock', grad_output_reshaped, unfold_x).view(self.weight.shape)
+        # grad_output_reshaped: (N, L, C_out) -> permute to (N, C_out, L)
+        grad_output_perm = grad_output_reshaped.permute(0, 2, 1)  # (N, C_out, L)
+        # Use einsum to sum over batch (n) and spatial locations (l), result shape (C_out, C_in*k*k)
+        grad_weight = torch.einsum('ncl,nml->cm', grad_output_perm, unfold_x).view(self.weight.shape)
 
 
         # Calculate grad_input: (N, C_in, H, W)
@@ -173,13 +176,12 @@ class CustomConv2D(nn.Module):
         grad_unfold = grad_output_reshaped @ self.weight.view(self.out_channels, -1) # (N, L, C_in*k*k)
         grad_unfold = grad_unfold.transpose(1, 2) # (N, C_in*k*k, L)
 
-        print(f"CustomConv2D backward - grad_unfold shape before fold: {grad_unfold.shape}")
-        print(f"CustomConv2D backward - fold output_size: {x.shape[2:]}")
+    # Debug prints removed to reduce console noise
 
         # Fold back to image space
         grad_input = F.fold(grad_unfold, output_size=x.shape[2:], kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
 
-        print(f"CustomConv2D backward - grad_input shape after fold: {grad_input.shape}")
+    # Debug prints removed to reduce console noise
 
 
         return grad_input, grad_weight, grad_bias
@@ -219,11 +221,12 @@ class CustomMaxPool2D(nn.Module):
         """
         #print(f"MaxPool2D input shape: {x.shape}") # Added print statement
         unfold_x = F.unfold(x, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
-        view_x = unfold_x.view(x.shape[0], x.shape[1], self.kernel_size, self.kernel_size, unfold_x.shape[2])
+        # reshape to (N, C, k*k, L) where L = number of sliding windows
+        view_x = unfold_x.view(x.shape[0], x.shape[1], self.kernel_size * self.kernel_size, unfold_x.shape[2])
+        # take max over the flattened k*k dimension -> (N, C, L)
         max_x, self._cache_indices = view_x.max(dim=2)
         self._cache_shape = x.shape
 
-        # Reshape output to (N, C, H_out, W_out)
         N, C, L = max_x.shape
         H_in, W_in = x.shape[2:]
         H_out = (H_in + 2 * self.padding - self.kernel_size) // self.stride + 1
@@ -342,7 +345,7 @@ class CNN(nn.Module):
         self.ACT, self.ACT_PRIME = get_activation(activation_name)
 
         self.conv1 = CustomConv2D(1, 32, 5)
-        self.conv2 = CustomConv2D(32, 64, 3) # Reduced kernel size to 3
+        self.conv2 = CustomConv2D(32, 64, 5)
         self.max1  = CustomMaxPool2D(2, stride=2)
         self.max2  = CustomMaxPool2D(2, stride=2)
         self.fc1   = CustomLinear(64*4*4, 512)
@@ -351,29 +354,19 @@ class CNN(nn.Module):
         self.criterion = CustomCrossEntropyLoss()
 
     def forward(self, x):
-        print(f"Input shape: {x.shape}")
+        # Reduced printing: remove per-batch debug output to speed up training
         z1 = self.conv1(x)
-        print(f"conv1 output shape: {z1.shape}")
         a1 = self.ACT(z1)
-        print(f"a1 shape: {a1.shape}")
         p1 = self.max1(a1)
-        print(f"max1 output shape: {p1.shape}")
 
         z2 = self.conv2(p1)
-        print(f"conv2 output shape: {z2.shape}")
         a2 = self.ACT(z2)
-        print(f"a2 shape: {a2.shape}")
         p2 = self.max2(a2)
-        print(f"max2 output shape: {p2.shape}")
 
         flat = torch.flatten(p2, start_dim=1)
-        print(f"flattened shape: {flat.shape}")
         z3 = self.fc1(flat)
-        print(f"fc1 output shape: {z3.shape}")
         a3 = self.ACT(z3)
-        print(f"a3 shape: {a3.shape}")
         logits = self.fc2(a3)
-        print(f"logits shape: {logits.shape}")
 
         # caches needed for manual backward
         caches = (z1, a1, p1, z2, a2, p2, z3, a3)
@@ -402,7 +395,7 @@ def sgd_update_(param, grad, lr):
     param -= lr * grad
     return param
 
-def train_one_config(activation_name="relu", epochs=num_epochs, lr=learning_rate, num_classes=num_classes):
+def train_one_config(activation_name="relu", epochs=num_epochs, lr=learning_rate, num_classes=num_classes, debug_batches=0):
     model = CNN(activation_name=activation_name, num_classes=num_classes).to(device)
     criterion = model.criterion
 
@@ -413,7 +406,7 @@ def train_one_config(activation_name="relu", epochs=num_epochs, lr=learning_rate
         model.train()
         total_train_loss, total_train_correct, total_train_examples = 0.0, 0, 0
 
-        for xb, yb in train_loader:
+        for batch_idx, (xb, yb) in enumerate(train_loader):
             xb, yb = xb.to(device), yb.to(device)
 
             # ---------- Forward ----------
@@ -454,8 +447,9 @@ def train_one_config(activation_name="relu", epochs=num_epochs, lr=learning_rate
             # Backpropagate through FC1
             grad_fc1_input, grad_fc1_w, grad_fc1_b = model.fc1.backward(grad_output=grad_activation3)
 
-            # Reshape gradient from FC1 input to match the shape before flattening (N, 64, 5, 5)
-            grad_fc1_input_reshaped = grad_fc1_input.view(grad_fc1_input.shape[0], 64, 5, 5)
+            # Reshape gradient from FC1 input to match the shape before flattening (N, 64, 4, 4)
+            # fc1 was constructed with input features 64*4*4, so the spatial dims are 4x4
+            grad_fc1_input_reshaped = grad_fc1_input.view(grad_fc1_input.shape[0], 64, 4, 4)
 
             # Backpropagate through MaxPool2
             grad_max2_input = model.max2.backward(grad_output=grad_fc1_input_reshaped)
@@ -481,20 +475,20 @@ def train_one_config(activation_name="relu", epochs=num_epochs, lr=learning_rate
             # TODO: UNCOMMENT THE CODES BELOW, DO NOT CHANGE
             # ===========================================
             with torch.no_grad():
-                 # FC2
-                 model.fc2.weight.copy_(sgd_update_(model.fc2.weight, grad_fc2_w, lr))
-                 if model.fc2.bias is not None:
-                     model.fc2.bias.copy_(sgd_update_(model.fc2.bias, grad_fc2_b, lr))
-                 # FC1
-                 model.fc1.weight.copy_(sgd_update_(model.fc1.weight, grad_fc1_w, lr))
-                 if model.fc1.bias is not None:
-                     model.fc1.bias.copy_(sgd_update_(model.fc1.bias, grad_fc1_b, lr))
-                 # Conv2
-                 model.conv2.weight.copy_(sgd_update_(model.conv2.weight, grad_conv2_w, lr))
-                 model.conv2.bias.copy_(sgd_update_(model.conv2.bias, grad_conv2_b, lr))
-                 # Conv1
-                 model.conv1.weight.copy_(sgd_update_(model.conv1.weight, grad_conv1_w, lr))
-                 model.conv1.bias.copy_(sgd_update_(model.conv1.bias, grad_conv1_b, lr))
+                # FC2
+                model.fc2.weight.copy_(sgd_update_(model.fc2.weight, grad_fc2_w, lr))
+                if model.fc2.bias is not None:
+                    model.fc2.bias.copy_(sgd_update_(model.fc2.bias, grad_fc2_b, lr))
+                # FC1
+                model.fc1.weight.copy_(sgd_update_(model.fc1.weight, grad_fc1_w, lr))
+                if model.fc1.bias is not None:
+                    model.fc1.bias.copy_(sgd_update_(model.fc1.bias, grad_fc1_b, lr))
+                # Conv2
+                model.conv2.weight.copy_(sgd_update_(model.conv2.weight, grad_conv2_w, lr))
+                model.conv2.bias.copy_(sgd_update_(model.conv2.bias, grad_conv2_b, lr))
+                # Conv1
+                model.conv1.weight.copy_(sgd_update_(model.conv1.weight, grad_conv1_w, lr))
+                model.conv1.bias.copy_(sgd_update_(model.conv1.bias, grad_conv1_b, lr))
 
 
             # ---------- Train metrics ----------
@@ -502,9 +496,15 @@ def train_one_config(activation_name="relu", epochs=num_epochs, lr=learning_rate
                 total_train_loss += loss.item()
                 total_train_examples += yb.size(0)
                 total_train_correct += (logits.argmax(1) == yb).sum().item()
+            # stop early when debugging small number of batches
+            if debug_batches > 0 and batch_idx + 1 >= debug_batches:
+                break
 
-        train_losses.append(total_train_loss / len(train_loader))
-        train_accs.append(total_train_correct / total_train_examples)
+        # If debug_batches is set, we only processed debug_batches per epoch so adjust divisor
+        effective_train_batches = debug_batches if debug_batches > 0 else len(train_loader)
+        train_losses.append(total_train_loss / effective_train_batches)
+        # compute train accuracy as fraction of examples processed
+        train_accs.append(total_train_correct / (effective_train_batches * batch_size))
 
         # ---------- Validation ----------
         model.eval()
