@@ -416,9 +416,18 @@ def train_one_config(activation_name="relu", epochs=num_epochs, lr=learning_rate
             # Backpropagate through FC1
             grad_fc1_input, grad_fc1_w, grad_fc1_b = model.fc1.backward(grad_output=grad_activation3)
 
-            # Reshape gradient from FC1 input to match the shape before flattening (N, 64, 4, 4)
-            # fc1 was constructed with input features 64*4*4, so the spatial dims are 4x4
-            grad_fc1_input_reshaped = grad_fc1_input.view(grad_fc1_input.shape[0], 64, 4, 4)
+            # Reshape gradient from FC1 input to match the shape before flattening (N, C, H, W)
+            # Infer spatial dims from the flattened size instead of hardcoding.
+            N = grad_fc1_input.shape[0]
+            C_flat = grad_fc1_input.shape[1]
+            expected_C = 64
+            if C_flat % expected_C != 0:
+                raise RuntimeError(f"Unexpected flattened channel size {C_flat} (not divisible by {expected_C})")
+            spatial = C_flat // expected_C
+            k = int(math.sqrt(spatial))
+            if k * k != spatial:
+                raise RuntimeError(f"Flattened spatial size {spatial} is not a perfect square (got sqrt {math.sqrt(spatial)})")
+            grad_fc1_input_reshaped = grad_fc1_input.view(N, expected_C, k, k)
 
             # Backpropagate through MaxPool2
             grad_max2_input = model.max2.backward(grad_output=grad_fc1_input_reshaped)
@@ -548,7 +557,7 @@ def plot_results(config_name, results):
         axes[1].legend()
         # also print on loss plot for visibility
         axes[0].text(0.02, 0.95, f"Test Acc: {test_acc:.2f}%", transform=axes[0].transAxes,
-                     fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                    fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     fig.suptitle(f"Training curves — {config_name}")
     fig.tight_layout(rect=[0, 0.03, 1, 0.95])
